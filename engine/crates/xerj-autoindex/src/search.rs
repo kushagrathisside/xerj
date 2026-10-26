@@ -8,7 +8,7 @@
 //! `multi_match` biased toward symbol definitions, printing a passage to read
 //! rather than a JSON blob to parse.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::esclient::Es;
 use crate::staleness;
@@ -31,6 +31,9 @@ OPTIONS:
                     usage error, not a silent default
     --full <CHARS>  max characters of each passage to print (default 600)
     --json          print the raw response instead of formatted passages
+
+    A value flag takes its value either as `--prefix ax` or `--prefix=ax`.
+    Put `--` before a query that starts with `-`: `xerj search -- \"-foo\"`.
 
 EXAMPLE:
     xerj --insecure -d ./.xerj-data &                 # a node, running
@@ -719,9 +722,12 @@ pub fn prefix_rewrite_note(given: &str, resolved: &ResolvedPrefix) -> Option<Str
 /// dropped, so `xerj search -k abc` kept the default of 5 and never said so.
 pub(crate) fn parse_count_arg(flag: &str, next: Option<String>) -> Result<usize, String> {
     match next {
-        Some(v) => v
-            .parse::<usize>()
-            .map_err(|_| format!("{flag} must be a non-negative whole number, got '{v}'")),
+        Some(v) => v.parse::<usize>().map_err(|_| {
+            format!(
+                "{flag} must be a non-negative whole number, got '{}'",
+                for_terminal(&v)
+            )
+        }),
         None => Err(format!("{flag} needs a number")),
     }
 }
@@ -774,30 +780,140 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Longest flag name that gets a guess. Past this, the edit-distance work is
+/// not worth it and the name is almost certainly text, not a flag.
+const MAX_HINTED_FLAG_CHARS: usize = 64;
+
+/// Longest argument echoed back in an error. Keeps one bad word from filling
+/// the terminal.
+const MAX_ECHO_CHARS: usize = 60;
+
+/// Text from the command line, made safe to print: control characters (escape
+/// sequences, newlines) are removed, and anything longer than [`MAX_ECHO_CHARS`]
+/// is cut with an ellipsis.
+fn for_terminal(s: &str) -> String {
+    let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+    if clean.chars().count() > MAX_ECHO_CHARS {
+        let head: String = clean.chars().take(MAX_ECHO_CHARS).collect();
+        format!("{head}…")
+    } else {
+        clean
+    }
+}
+
+/// A prefix tree over flag names. Asked for a prefix, it answers with the one
+/// flag that starts with it, or nothing when the prefix is shared or unknown.
+#[derive(Default)]
+struct FlagTrie {
+    children: BTreeMap<char, FlagTrie>,
+    flag: Option<&'static str>,
+}
+
+impl FlagTrie {
+    fn insert(&mut self, word: &'static str) {
+        let mut node = self;
+        for c in word.chars() {
+            node = node.children.entry(c).or_default();
+        }
+        node.flag = Some(word);
+    }
+
+    fn unique_completion(&self, prefix: &str) -> Option<&'static str> {
+        let mut node = self;
+        for c in prefix.chars() {
+            node = node.children.get(&c)?;
+        }
+        let mut found = Vec::new();
+        node.collect(&mut found);
+        match found.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
+    fn collect(&self, out: &mut Vec<&'static str>) {
+        out.extend(self.flag);
+        for child in self.children.values() {
+            child.collect(out);
+        }
+    }
+}
+
+/// The flag to suggest for an unknown one, if any: an explicit guess first,
+/// then the only flag the name is a prefix of, then the closest long flag
+/// within two edits. Single-dash names get no guess.
+fn flag_hint(name: &str) -> Option<&'static str> {
+    if name.chars().count() > MAX_HINTED_FLAG_CHARS {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    if let Some(real) = FLAG_GUESSES
+        .iter()
+        .find(|(guess, _)| *guess == lower)
+        .map(|(_, real)| *real)
+    {
+        return Some(real);
+    }
+    if !lower.starts_with("--") {
+        return None;
+    }
+    let mut trie = FlagTrie::default();
+    for flag in SUGGESTABLE_FLAGS {
+        trie.insert(flag);
+    }
+    if let Some(flag) = trie.unique_completion(&lower) {
+        return Some(flag);
+    }
+    SUGGESTABLE_FLAGS
+        .iter()
+        .map(|real| (edit_distance(&lower, real), *real))
+        .filter(|(d, _)| *d <= 2)
+        .min()
+        .map(|(_, real)| real)
+}
+
 /// The one-line refusal for a flag this command does not know (#2458).
 /// The text after `=` is not part of the flag's name, so `--index=foo`
-/// names `--index`. Only `--` flags get a near-miss guess.
+/// names `--index`. The name is echoed through [`for_terminal`].
 pub(crate) fn unknown_flag_message(given: &str) -> String {
     let name = given.split('=').next().unwrap_or(given);
-    let hint = FLAG_GUESSES
-        .iter()
-        .find(|(guess, _)| *guess == name)
-        .map(|(_, real)| *real)
-        .or_else(|| {
-            if !name.starts_with("--") {
-                return None;
-            }
-            SUGGESTABLE_FLAGS
-                .iter()
-                .map(|real| (edit_distance(name, real), *real))
-                .filter(|(d, _)| *d <= 2)
-                .min()
-                .map(|(_, real)| real)
-        });
-    let did_you_mean = hint
+    let did_you_mean = flag_hint(name)
         .map(|real| format!(" (did you mean {real}?)"))
         .unwrap_or_default();
-    format!("xerj search: unknown flag '{name}'{did_you_mean}\nrun 'xerj search --help' for the options")
+    format!(
+        "xerj search: unknown flag '{}'{did_you_mean}\nrun 'xerj search --help' for the options",
+        for_terminal(name)
+    )
+}
+
+/// The value for a flag that takes one: `--name=value`, or the next word. A
+/// missing or empty value, or a next word that is itself a flag, is an error,
+/// so `--prefix --json` never quietly uses `--json` as the prefix.
+fn take_value(
+    name: &str,
+    inline: Option<String>,
+    it: &mut impl Iterator<Item = String>,
+) -> Result<String, String> {
+    let value = match inline {
+        Some(v) => v,
+        None => match it.next() {
+            Some(v) if !v.starts_with('-') => v,
+            Some(v) => return Err(format!("{name} needs a value, got '{}'", for_terminal(&v))),
+            None => return Err(format!("{name} needs a value")),
+        },
+    };
+    if value.is_empty() {
+        return Err(format!("{name} needs a value"));
+    }
+    Ok(value)
+}
+
+/// A switch takes no value. `--json=1` is an error, never a silent true.
+fn no_value(name: &str, inline: &Option<String>) -> Result<(), String> {
+    match inline {
+        Some(_) => Err(format!("{name} takes no value")),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug)]
@@ -833,29 +949,53 @@ fn parse_search_cli(
     let mut query: Option<String> = None;
 
     let mut it = args;
+    let mut flags_ended = false;
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "-h" | "--help" => return Ok(SearchCli::Help),
-            "--url" => url = it.next().unwrap_or_default(),
-            "--prefix" => prefix = it.next().unwrap_or(prefix),
-            "--api-key" => api_key = it.next(),
-            "-k" => k = parse_count_arg("-k", it.next())?,
-            "--full" => full = parse_count_arg("--full", it.next())?,
-            "--json" => as_json = true,
+        // `--` ends the flags, and a lone `-` is text (the stdin convention).
+        // Words after that point are text even when they start with `-`.
+        if flags_ended || !a.starts_with('-') || a == "-" {
+            if query.is_none() {
+                query = Some(a);
+                continue;
+            }
+            return Err(format!("unexpected argument '{}'", for_terminal(&a)));
+        }
+        if a == "--" {
+            flags_ended = true;
+            continue;
+        }
+        // `--name=value` and `--name value` both work. The `=` part is not
+        // part of the name, so it is split off before any matching.
+        let (name, inline) = match a.split_once('=') {
+            Some((name, value)) => (name.to_string(), Some(value.to_string())),
+            None => (a.clone(), None),
+        };
+        match name.as_str() {
+            "-h" | "--help" => {
+                no_value(&name, &inline)?;
+                return Ok(SearchCli::Help);
+            }
+            "--url" => url = take_value("--url", inline, &mut it)?,
+            "--prefix" => prefix = take_value("--prefix", inline, &mut it)?,
+            "--api-key" => api_key = Some(take_value("--api-key", inline, &mut it)?),
+            "-k" => k = parse_count_arg("-k", inline.or_else(|| it.next()))?,
+            "--full" => full = parse_count_arg("--full", inline.or_else(|| it.next()))?,
+            "--json" => {
+                no_value(&name, &inline)?;
+                as_json = true;
+            }
             // Read by feedback::enabled from the raw argv. Accepted so
             // `xerj search --disable-feedback` is not an unexpected argument.
-            "--disable-feedback" => {}
+            "--disable-feedback" => no_value(&name, &inline)?,
             "--mode" => {
-                let asked = it.next().unwrap_or_default();
-                eprintln!("{}", search_mode_refusal(&asked));
+                let asked = inline.or_else(|| it.next()).unwrap_or_default();
+                eprintln!("{}", search_mode_refusal(&for_terminal(&asked)));
                 return Ok(SearchCli::Refuse);
             }
-            other if !other.starts_with('-') && query.is_none() => query = Some(other.to_string()),
-            other if other.starts_with('-') => {
-                eprintln!("{}", unknown_flag_message(other));
+            _ => {
+                eprintln!("{}", unknown_flag_message(&name));
                 return Ok(SearchCli::Refuse);
             }
-            other => return Err(format!("unexpected argument '{other}'")),
         }
     }
     Ok(SearchCli::Query(ParsedSearch {
@@ -1326,6 +1466,198 @@ mod tests {
         let err = parse_search_cli(words(&["needle", "other"]).into_iter(), String::new(), None)
             .expect_err("a second plain word is not a flag");
         assert!(err.contains("unexpected argument 'other'"), "{err}");
+    }
+
+    fn parsed_query(args: &[&str]) -> ParsedSearch {
+        match parse_search_cli(words(args).into_iter(), String::new(), None)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+        {
+            SearchCli::Query(q) => q,
+            _ => panic!("expected a query from {args:?}"),
+        }
+    }
+
+    /// `--` ends the flags: what follows is text, even if it starts with `-`.
+    #[test]
+    fn double_dash_ends_the_flags() {
+        assert_eq!(parsed_query(&["--", "-foo"]).query.as_deref(), Some("-foo"));
+        assert_eq!(
+            parsed_query(&["--", "--json"]).query.as_deref(),
+            Some("--json")
+        );
+        assert!(!parsed_query(&["--", "--json"]).as_json);
+        assert_eq!(parsed_query(&["--"]).query, None);
+        // A second word after `--` is still a second word.
+        let err = parse_search_cli(words(&["--", "a", "b"]).into_iter(), String::new(), None)
+            .expect_err("two words");
+        assert!(err.contains("unexpected argument 'b'"), "{err}");
+        let err = parse_search_cli(
+            words(&["needle", "--", "--json"]).into_iter(),
+            String::new(),
+            None,
+        )
+        .expect_err("a flag-looking word after `--` is a second word");
+        assert!(err.contains("unexpected argument '--json'"), "{err}");
+    }
+
+    /// `--name=value` is the same as `--name value` for value flags.
+    #[test]
+    fn equals_form_sets_a_value_flag() {
+        let q = parsed_query(&["--prefix=ax", "--full=0", "needle"]);
+        assert_eq!(q.prefix, "ax");
+        assert_eq!(q.full, 0);
+        assert_eq!(q.query.as_deref(), Some("needle"));
+        assert_eq!(parsed_query(&["-k=3", "needle"]).k, 3);
+        let q = parse_search_cli(
+            words(&["--url=http://n:9", "--api-key=abc", "needle"]).into_iter(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        let SearchCli::Query(q) = q else {
+            panic!("query")
+        };
+        assert_eq!(q.url, "http://n:9");
+        assert_eq!(q.api_key.as_deref(), Some("abc"));
+    }
+
+    /// A value flag with nothing to take is an error, never a silent default.
+    #[test]
+    fn a_value_flag_without_a_value_is_an_error() {
+        for (args, want) in [
+            (vec!["--prefix"], "--prefix needs a value"),
+            (vec!["--prefix="], "--prefix needs a value"),
+            (vec!["--prefix", "", "needle"], "--prefix needs a value"),
+            (
+                vec!["--url", "--json", "needle"],
+                "--url needs a value, got '--json'",
+            ),
+            (vec!["--api-key"], "--api-key needs a value"),
+            (vec!["-k"], "-k needs a number"),
+        ] {
+            let err = parse_search_cli(words(&args).into_iter(), String::new(), None)
+                .expect_err(&format!("{args:?} must be an error"));
+            assert!(err.contains(want), "{args:?}: {err}");
+        }
+    }
+
+    /// A switch takes no value, so `--json=1` is an error, not a silent true.
+    #[test]
+    fn a_switch_with_a_value_is_an_error() {
+        for args in [
+            vec!["--json=1", "needle"],
+            vec!["--help=x"],
+            vec!["--json="],
+        ] {
+            let err = parse_search_cli(words(&args).into_iter(), String::new(), None)
+                .expect_err(&format!("{args:?} must be an error"));
+            assert!(err.contains("takes no value"), "{args:?}: {err}");
+        }
+    }
+
+    /// Repeated flags: the last value wins, as in most CLIs.
+    #[test]
+    fn a_repeated_value_flag_takes_the_last_value() {
+        assert_eq!(
+            parsed_query(&["--prefix", "a", "--prefix", "b", "q"]).prefix,
+            "b"
+        );
+    }
+
+    /// `--mode=semantic` is still the mode refusal, not an unknown flag.
+    #[test]
+    fn mode_with_equals_is_still_refused_as_mode() {
+        let parsed = parse_search_cli(
+            words(&["--mode=semantic", "q"]).into_iter(),
+            String::new(),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(parsed, SearchCli::Refuse));
+    }
+
+    /// Flags are matched case-sensitively, but the hint ignores case.
+    #[test]
+    fn a_wrong_case_flag_is_refused_and_hinted() {
+        let parsed =
+            parse_search_cli(words(&["--Index", "q"]).into_iter(), String::new(), None).unwrap();
+        assert!(matches!(parsed, SearchCli::Refuse));
+        assert!(unknown_flag_message("--Index").contains("did you mean --prefix?"));
+    }
+
+    /// Text from the command line is printed raw to the terminal, so control
+    /// characters are removed and long names are cut short.
+    #[test]
+    fn echoed_text_has_no_control_characters_and_is_capped() {
+        let msg = unknown_flag_message("--in\u{1b}[31mdex");
+        assert!(msg.chars().all(|c| c == '\n' || !c.is_control()), "{msg:?}");
+        let long = format!("--{}", "a".repeat(300));
+        let msg = unknown_flag_message(&long);
+        assert!(msg.len() < 200, "{msg}");
+        assert!(msg.contains('…'), "{msg}");
+        assert!(!msg.contains("did you mean"), "{msg}");
+        let err = parse_search_cli(
+            words(&["needle", "x\u{1b}y"]).into_iter(),
+            String::new(),
+            None,
+        )
+        .expect_err("second word");
+        assert!(err.chars().all(|c| c == '\n' || !c.is_control()), "{err:?}");
+    }
+
+    /// A unique prefix of a flag is completed; an ambiguous one is not.
+    #[test]
+    fn a_unique_prefix_completes_to_its_flag() {
+        assert!(unknown_flag_message("--pre").contains("did you mean --prefix?"));
+        assert!(unknown_flag_message("--a").contains("did you mean --api-key?"));
+        assert!(unknown_flag_message("--j").contains("did you mean --json?"));
+        assert!(unknown_flag_message("--f").contains("did you mean --full?"));
+        assert!(unknown_flag_message("--h").contains("did you mean --help?"));
+    }
+
+    #[test]
+    fn the_trie_completes_only_unique_prefixes() {
+        let mut trie = FlagTrie::default();
+        for word in ["--prefix", "--api-key", "--print"] {
+            trie.insert(word);
+        }
+        // `--p` is shared by --prefix and --print; `--pre` and `--pri` each name one.
+        assert_eq!(trie.unique_completion("--p"), None);
+        assert_eq!(trie.unique_completion("--pr"), None);
+        assert_eq!(trie.unique_completion("--pre"), Some("--prefix"));
+        assert_eq!(trie.unique_completion("--pri"), Some("--print"));
+        assert_eq!(trie.unique_completion("--a"), Some("--api-key"));
+        assert_eq!(trie.unique_completion("--"), None);
+        assert_eq!(trie.unique_completion("--z"), None);
+        assert_eq!(trie.unique_completion("--prefix"), Some("--prefix"));
+    }
+
+    /// A typo that is not a prefix still gets the closest flag.
+    #[test]
+    fn a_typo_gets_the_closest_flag() {
+        assert!(unknown_flag_message("--prefx").contains("did you mean --prefix?"));
+        assert!(unknown_flag_message("--ful").contains("did you mean --full?"));
+    }
+
+    /// Single-dash flags get no guess, so `-x` and `-K` do not become `-h` or `-k`.
+    #[test]
+    fn a_single_dash_flag_gets_no_guess() {
+        assert!(!unknown_flag_message("-x").contains("did you mean"));
+        assert!(!unknown_flag_message("-K").contains("did you mean"));
+    }
+
+    /// Flags are read left to right, so an earlier error wins over `-h`.
+    #[test]
+    fn the_first_flag_decides_before_help_is_read() {
+        let parsed =
+            parse_search_cli(words(&["--index", "-h"]).into_iter(), String::new(), None).unwrap();
+        assert!(matches!(parsed, SearchCli::Refuse));
+    }
+
+    #[test]
+    fn json_is_a_flag_wherever_it_sits() {
+        assert!(parsed_query(&["needle", "--json"]).as_json);
+        assert!(parsed_query(&["--json", "needle"]).as_json);
     }
 
     #[test]

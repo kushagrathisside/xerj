@@ -124,6 +124,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_forcemerge` batches are charged but never refused, and neither is a
   small batch that the yield-streak rule (#2468) lets run to completion.
 
+- `xerj search` refuses an unknown flag in one line that names it, with a
+  "did you mean" hint for common guesses (`--index` -> `--prefix`,
+  `--max-hits` -> `-k`) and for near misses, and exits 2 without the usage
+  block (#2458). `--prefix=ax` and `--prefix ax` both work; a value flag
+  with no value is now an error instead of a silent default; `--` ends the
+  flags, so a query can start with `-`.
+
 - The parent memory breaker no longer flaps, and background merges and flush
   finalizes are bounded while it is engaged (#2427). A 3,000 MB autoindex run
   engaged the breaker 20 times in 16 minutes, often releasing 100-500 ms
