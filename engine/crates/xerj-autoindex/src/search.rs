@@ -736,6 +736,70 @@ pub(crate) fn fuller_than(full: usize) -> usize {
     }
 }
 
+/// Flags people often guess, mapped to the flag that does the job. Hand-written
+/// and only ever shown as a hint, so a guess is never silently rewritten.
+const FLAG_GUESSES: &[(&str, &str)] = &[
+    ("--index", "--prefix"),
+    ("--max-hits", "-k"),
+    ("--max-results", "-k"),
+    ("--limit", "-k"),
+    ("--top", "-k"),
+    ("--size", "-k"),
+];
+
+/// The long flags a near miss is compared against. `--mode` is left out
+/// because it is refused on purpose, and `--disable-feedback` is ignored.
+const SUGGESTABLE_FLAGS: &[&str] = &[
+    "--url",
+    "--prefix",
+    "--api-key",
+    "--full",
+    "--json",
+    "--help",
+];
+
+/// Levenshtein distance over chars. Flag names are short, so the quadratic
+/// cost does not matter.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != *cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// The one-line refusal for a flag this command does not know (#2458).
+/// The text after `=` is not part of the flag's name, so `--index=foo`
+/// names `--index`. Only `--` flags get a near-miss guess.
+pub(crate) fn unknown_flag_message(given: &str) -> String {
+    let name = given.split('=').next().unwrap_or(given);
+    let hint = FLAG_GUESSES
+        .iter()
+        .find(|(guess, _)| *guess == name)
+        .map(|(_, real)| *real)
+        .or_else(|| {
+            if !name.starts_with("--") {
+                return None;
+            }
+            SUGGESTABLE_FLAGS
+                .iter()
+                .map(|real| (edit_distance(name, real), *real))
+                .filter(|(d, _)| *d <= 2)
+                .min()
+                .map(|(_, real)| real)
+        });
+    let did_you_mean = hint
+        .map(|real| format!(" (did you mean {real}?)"))
+        .unwrap_or_default();
+    format!("xerj search: unknown flag '{name}'{did_you_mean}\nrun 'xerj search --help' for the options")
+}
+
 #[derive(Debug)]
 struct ParsedSearch {
     url: String,
@@ -787,6 +851,10 @@ fn parse_search_cli(
                 return Ok(SearchCli::Refuse);
             }
             other if !other.starts_with('-') && query.is_none() => query = Some(other.to_string()),
+            other if other.starts_with('-') => {
+                eprintln!("{}", unknown_flag_message(other));
+                return Ok(SearchCli::Refuse);
+            }
             other => return Err(format!("unexpected argument '{other}'")),
         }
     }
@@ -1217,6 +1285,47 @@ mod tests {
 
     fn words(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// #2458: an unknown flag is refused in one line, without the USAGE dump
+    /// that made it look like help.
+    #[test]
+    fn an_unknown_flag_is_refused_without_a_usage_dump() {
+        for args in [
+            vec!["--index", "foo", "needle"],
+            vec!["needle", "--max-hits", "5"],
+        ] {
+            let parsed = parse_search_cli(words(&args).into_iter(), String::new(), None)
+                .unwrap_or_else(|e| panic!("{args:?} should be a refusal, not an error: {e}"));
+            assert!(matches!(parsed, SearchCli::Refuse), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_flag_messages_name_the_flag_and_the_closest_real_one() {
+        assert_eq!(
+            unknown_flag_message("--index"),
+            "xerj search: unknown flag '--index' (did you mean --prefix?)\n\
+             run 'xerj search --help' for the options"
+        );
+        assert!(unknown_flag_message("--max-hits").contains("did you mean -k?"));
+        assert!(unknown_flag_message("--ful").contains("did you mean --full?"));
+        // The value after `=` is not part of the flag's name.
+        let eq = unknown_flag_message("--index=foo");
+        assert!(eq.contains("unknown flag '--index'"), "{eq}");
+        assert!(!eq.contains("foo"), "{eq}");
+        // No close match, so no guess.
+        assert!(!unknown_flag_message("--zzzzzzzz").contains("did you mean"));
+        // A single-dash flag gets no suggestion: `-x` is one edit from `-k` and `-h`.
+        assert!(!unknown_flag_message("-x").contains("did you mean"));
+    }
+
+    /// A second plain word is a different mistake, so it keeps its own error.
+    #[test]
+    fn a_second_plain_word_keeps_the_unexpected_argument_error() {
+        let err = parse_search_cli(words(&["needle", "other"]).into_iter(), String::new(), None)
+            .expect_err("a second plain word is not a flag");
+        assert!(err.contains("unexpected argument 'other'"), "{err}");
     }
 
     #[test]
