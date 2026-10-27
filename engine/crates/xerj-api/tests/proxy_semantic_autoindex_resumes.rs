@@ -70,7 +70,7 @@ async fn mock_embedder() -> (String, Arc<EmbedLog>) {
                     || !shared.reject.load(Ordering::SeqCst)
                     || shared
                         .allow_document_requests
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                             left.checked_sub(1)
                         })
                         .is_ok();

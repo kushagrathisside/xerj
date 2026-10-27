@@ -12540,8 +12540,8 @@ fn run_date_range(
         // `from`/`to` can be ISO-8601 strings or raw numbers. Both cases
         // convert through parse_date_ms so bucket comparisons work on
         // millis.
-        let from_ms = range_def.get("from").and_then(&parse_with_fmt);
-        let to_ms = range_def.get("to").and_then(&parse_with_fmt);
+        let from_ms = range_def.get("from").and_then(parse_with_fmt);
+        let to_ms = range_def.get("to").and_then(parse_with_fmt);
         let from_str_in = range_def.get("from").and_then(Value::as_str);
         let to_str_in = range_def.get("to").and_then(Value::as_str);
 

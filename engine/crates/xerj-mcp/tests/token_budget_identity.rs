@@ -129,7 +129,7 @@ async fn json_budget_identity_survives_http_dispatch_and_source_projection() {
                 "each call is made with and without a budget: {}",
                 requests.len()
             );
-            for pair in requests.chunks_exact(2) {
+            for pair in requests.as_chunks::<2>().0 {
                 assert_eq!(
                     pair[0], pair[1],
                     "the budget must not change the engine request"

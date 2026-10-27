@@ -50,9 +50,9 @@ pub fn unpack_f32_vector(value: &str) -> Option<Vec<f32>> {
     }
     let mut out = Vec::with_capacity(rest.len() / 8);
     let bytes = rest.as_bytes();
-    for chunk in bytes.chunks_exact(8) {
+    for chunk in bytes.as_chunks::<8>().0 {
         let mut le = [0u8; 4];
-        for (i, pair) in chunk.chunks_exact(2).enumerate() {
+        for (i, pair) in chunk.as_chunks::<2>().0.iter().enumerate() {
             le[i] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
         }
         let decoded = f32::from_le_bytes(le);

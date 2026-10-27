@@ -46,7 +46,7 @@ async fn batch_preserves_positions_errors_duplicates_and_exact_ids() {
                         .lines()
                         .map(|s| serde_json::from_str(s).unwrap())
                         .collect();
-                    let responses: Vec<Value> = lines.chunks_exact(2).map(|pair| {
+                    let responses: Vec<Value> = lines.as_chunks::<2>().0.iter().map(|pair| {
                     assert_eq!(pair[0]["index"], "docs");
                     let q = pair[1]["query"].to_string();
                     if q.contains("missing") {

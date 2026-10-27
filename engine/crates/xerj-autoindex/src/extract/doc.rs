@@ -235,7 +235,9 @@ fn text_from_piece_table(
             let byte_len = char_count.checked_mul(2)?;
             let bytes = word.get(start..start.checked_add(byte_len)?)?;
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             out.push_str(&String::from_utf16_lossy(&units));
@@ -370,7 +372,9 @@ fn property_string(s: &[u8], pid: u32) -> Option<String> {
             let byte_len = len.checked_mul(2)?;
             let bytes = s.get(data_off..data_off.checked_add(byte_len)?)?;
             let mut units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect();
             if let Some(pos) = units.iter().position(|&u| u == 0) {

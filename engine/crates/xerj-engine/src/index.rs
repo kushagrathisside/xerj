@@ -17059,7 +17059,7 @@ impl Index {
                 }
                 // Item 8: pruned doc leaves the coverage-gate denominator.
                 self.vector_doc_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                         Some(v.saturating_sub(1))
                     })
                     .ok();
@@ -21472,7 +21472,7 @@ impl Index {
             self.hnsw_id_rev.write().await.remove(&node_id);
             // Item 8: this doc leaves the coverage-gate denominator.
             self.vector_doc_count
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(1))
                 })
                 .ok();
